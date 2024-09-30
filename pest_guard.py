@@ -1,92 +1,105 @@
 import cv2
-import os
 import numpy as np
 import time
-from picamera2 import Picamera2, Preview
+from picamera2 import Picamera2
+import os
 
-def extract_features(image_path):
-    """Extract features from a given image."""
-    img = cv2.imread(image_path)
-    if img is None:
-        print(f"Could not load image: {image_path}")
-        return None, None
-    orb = cv2.ORB_create()
-    keypoints, descriptors = orb.detectAndCompute(img, None)
+# Initialize Picamera2
+camera = Picamera2()
+camera.configure(camera.create_still_configuration())
+
+# Path to your dataset folder
+dataset_path = "/home/naji/naji_project/Miner leaves/"
+
+# Helper Functions
+def preprocess_image(image):
+    """Preprocess image by converting to grayscale and applying Gaussian blur."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    return blurred
+
+def extract_orb_features(image):
+    """Extract ORB keypoints and descriptors from the image."""
+    orb = cv2.ORB_create(nfeatures=500)
+    keypoints, descriptors = orb.detectAndCompute(image, None)
     return keypoints, descriptors
 
-def compare_images(query_image_path, dataset_folder_path):
-    # Load the query image
-    query_img = cv2.imread(query_image_path)
-    if query_img is None:
-        print(f"Could not load query image: {query_image_path}")
-        return
+def match_features(descriptors1, descriptors2):
+    """Match ORB descriptors between the captured image and a dataset image."""
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(descriptors1, descriptors2)
+    matches = sorted(matches, key=lambda x: x.distance)  # Sort by distance (similarity)
+    return matches
+
+def calculate_confidence(matches):
+    """Calculate the confidence score based on the number and quality of matches."""
+    if not matches:
+        return 0
+    avg_distance = np.mean([m.distance for m in matches])
+    confidence = max(1 - avg_distance / 100, 0)  # Confidence score between 0 and 1
+    return confidence * 100  # Convert to percentage
+
+def find_best_match(captured_image):
+    """Compare the captured image with each image in the dataset and find the best match."""
+    best_confidence = 0
+    best_match_filename = None
+
+    # Preprocess the captured image
+    preprocessed = preprocess_image(captured_image)
     
-    # Extract features from the query image
-    orb = cv2.ORB_create()
-    query_keypoints, query_descriptors = orb.detectAndCompute(query_img, None)
-    print(f"Query image keypoints: {len(query_keypoints)}")
-    
-    # Initialize variables for confidence scores
-    affected_count = 0
-    confidence_threshold = 0.5  # Set a threshold for confidence score
+    # Extract ORB features from the captured image
+    keypoints1, descriptors1 = extract_orb_features(preprocessed)
 
-    # Loop through each image in the dataset folder
-    for image_file in os.listdir(dataset_folder_path):
-        dataset_image_path = os.path.join(dataset_folder_path, image_file)
-        dataset_keypoints, dataset_descriptors = extract_features(dataset_image_path)
-        
-        if dataset_descriptors is None:
-            continue  # Skip if the dataset image could not be loaded
+    # Loop through each image in the dataset
+    for dataset_image_filename in os.listdir(dataset_path):
+        dataset_image_path = os.path.join(dataset_path, dataset_image_filename)
+        dataset_image = cv2.imread(dataset_image_path)
+        if dataset_image is None:
+            continue
 
-        # Create a Brute-Force Matcher
-        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-        matches = bf.match(query_descriptors, dataset_descriptors)
-        matches = sorted(matches, key=lambda x: x.distance)
+        # Preprocess dataset image and extract ORB features
+        preprocessed_dataset_image = preprocess_image(dataset_image)
+        keypoints2, descriptors2 = extract_orb_features(preprocessed_dataset_image)
 
-        # Calculate the average distance of the matches
-        if matches:
-            average_distance = np.mean([m.distance for m in matches])
-            max_distance = 100  # Adjust this based on your data
-            confidence_score = 1 - (average_distance / max_distance)
-            confidence_score = max(0, min(confidence_score, 1))  # Clamp to [0, 1]
+        # Match features between the captured image and the dataset image
+        matches = match_features(descriptors1, descriptors2)
+        confidence = calculate_confidence(matches)
 
-            # Determine if the leaf is affected based on confidence score
-            affected_status = "Affected" if confidence_score > confidence_threshold else "Not Affected"
-            if affected_status == "Affected":
-                affected_count += 1
+        # Keep track of the highest confidence match
+        if confidence > best_confidence:
+            best_confidence = confidence
+            best_match_filename = dataset_image_filename
 
-            print(f"Matches with {image_file} - Confidence Score: {confidence_score:.2f} - {affected_status}")
-    
-    print(f'Number of affected leaves: {affected_count} out of {len(os.listdir(dataset_folder_path))}')
+    return best_match_filename, best_confidence
 
-def capture_and_compare(interval_seconds, dataset_folder_path, num_images):
-    picam2 = Picamera2()
-    picam2.configure(picam2.create_preview_configuration())
-    picam2.start()
+def capture_and_process(threshold=80):
+    """
+    Capture an image, process it for leaf disease detection via ORB matching, then discard it.
+    """
+    # Capture image
+    filename = "leaf_image.jpg"
+    camera.start()
+    time.sleep(2)  # Wait for camera to adjust
+    camera.capture_file(filename)
+    camera.stop()
 
-    try:
-        for i in range(num_images):
-            # Capture image
-            image_path = f"captured_image_{i}.jpg"
-            picam2.capture_file(image_path)
-            print(f"Captured image {i + 1}/{num_images}")
+    # Read captured image
+    captured_image = cv2.imread(filename)
 
-            # Compare with the dataset
-            compare_images(image_path, dataset_folder_path)
+    # Compare the captured image with the dataset
+    best_match, confidence = find_best_match(captured_image)
 
-            # Wait for the next interval
-            time.sleep(interval_seconds)
+    # Decision based on confidence
+    if confidence > threshold:
+        print(f"Leaf is affected! Match found with: {best_match}, Confidence: {confidence}%")
+    else:
+        print(f"Leaf is healthy or not matching any affected dataset image. Confidence: {confidence}%")
 
-    except KeyboardInterrupt:
-        print("Image capture stopped by user.")
-    finally:
-        picam2.stop()
+    # Discard the image after processing
+    print("Processing done. Discarding image...")
+    return True
 
-if __name__ == "__main__":
-    # Parameters for image capture
-    interval_seconds = 10  # Time interval in seconds
-    dataset_folder_path = '/path/to/your/dataset'  # Replace with your dataset folder path
-    num_images = 5  # Number of images to capture
-
-    # Start capturing and comparing
-    capture_and_compare(interval_seconds, dataset_folder_path, num_images)
+# Main Loop
+while True:
+    capture_and_process()
+    time.sleep(300)  # Wait for 5 minutes before capturing the next image
