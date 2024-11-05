@@ -1,8 +1,13 @@
+import paho.mqtt.client as mqtt
 import cv2
 import numpy as np
 import time
 from picamera2 import Picamera2
 import os
+import json
+
+THINGSBOARD_HOST = 'YOUR_THINGSBOARD_IP_OR_HOSTNAME'
+ACCESS_TOKEN = 'RASPBERRY_PI_DEMO_TOKEN'
 
 # Initialize Picamera2
 camera = Picamera2()
@@ -18,64 +23,60 @@ def preprocess_image(image):
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     return blurred
 
-def extract_orb_features(image):
-    """Extract ORB keypoints and descriptors from the image."""
-    orb = cv2.ORB_create(nfeatures=500)
-    keypoints, descriptors = orb.detectAndCompute(image, None)
-    return keypoints, descriptors
+def extract_disease_patches(image):
+    """Extract disease patches based on color and hue."""
+    hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    # Define the hue range for diseased patches (adjust these values if needed)
+    lower_hue = np.array([0, 100, 100])  # Lower hue threshold
+    upper_hue = np.array([20, 255, 255])  # Upper hue threshold
+    # Create a mask for diseased areas
+    disease_mask = cv2.inRange(hsv_image, lower_hue, upper_hue)
+    # Extract diseased regions
+    disease_patches = cv2.bitwise_and(image, image, mask=disease_mask)
+    return disease_patches, disease_mask
 
-def match_features(descriptors1, descriptors2):
-    """Match ORB descriptors between the captured image and a dataset image."""
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    matches = bf.match(descriptors1, descriptors2)
-    matches = sorted(matches, key=lambda x: x.distance)  # Sort by distance (similarity)
-    return matches
+def extract_features_from_disease_patches(image):
+    """Extract color features from diseased patches."""
+    disease_patches, mask = extract_disease_patches(image)
+    # Calculate color histogram for the diseased patches
+    if cv2.countNonZero(mask) == 0:
+        return None  # No diseased patches detected
+    hist = cv2.calcHist([disease_patches], [0, 1, 2], mask, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+    hist = cv2.normalize(hist, hist).flatten()
+    return hist
 
-def calculate_confidence(matches):
-    """Calculate the confidence score based on the number and quality of matches."""
-    if not matches:
-        return 0
-    avg_distance = np.mean([m.distance for m in matches])
-    confidence = max(1 - avg_distance / 100, 0)  # Confidence score between 0 and 1
-    return confidence * 100  # Convert to percentage
+def match_features(hist1, hist2):
+    """Match color histograms using correlation."""
+    return cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
 
 def find_best_match(captured_image):
     """Compare the captured image with each image in the dataset and find the best match."""
     best_confidence = 0
     best_match_filename = None
-
-    # Preprocess the captured image
-    preprocessed = preprocess_image(captured_image)
-    
-    # Extract ORB features from the captured image
-    keypoints1, descriptors1 = extract_orb_features(preprocessed)
-
-    # Loop through each image in the dataset
+    best_match_image = None
+    # Extract features from the captured image
+    hist1 = extract_features_from_disease_patches(captured_image)
+    if hist1 is None:
+        return None, 0, None  # No diseased patches detected
     for dataset_image_filename in os.listdir(dataset_path):
         dataset_image_path = os.path.join(dataset_path, dataset_image_filename)
         dataset_image = cv2.imread(dataset_image_path)
         if dataset_image is None:
             continue
-
-        # Preprocess dataset image and extract ORB features
-        preprocessed_dataset_image = preprocess_image(dataset_image)
-        keypoints2, descriptors2 = extract_orb_features(preprocessed_dataset_image)
-
-        # Match features between the captured image and the dataset image
-        matches = match_features(descriptors1, descriptors2)
-        confidence = calculate_confidence(matches)
-
+        hist2 = extract_features_from_disease_patches(dataset_image)
+        if hist2 is None:
+            continue
+        # Match the histograms
+        confidence = match_features(hist1, hist2)
         # Keep track of the highest confidence match
         if confidence > best_confidence:
             best_confidence = confidence
             best_match_filename = dataset_image_filename
+            best_match_image = dataset_image
+    return best_match_filename, best_confidence, best_match_image
 
-    return best_match_filename, best_confidence
-
-def capture_and_process(threshold=80):
-    """
-    Capture an image, process it for leaf disease detection via ORB matching, then discard it.
-    """
+def capture_and_process(threshold=0.8):
+    """Capture an image, process it for leaf disease detection, and send telemetry data to ThingsBoard."""
     # Capture image
     filename = "leaf_image.jpg"
     camera.start()
@@ -85,21 +86,48 @@ def capture_and_process(threshold=80):
 
     # Read captured image
     captured_image = cv2.imread(filename)
+    # Check for diseased patches and match
+    best_match, confidence, match_image = find_best_match(captured_image)
 
-    # Compare the captured image with the dataset
-    best_match, confidence = find_best_match(captured_image)
-
-    # Decision based on confidence
+    # Decide based on confidence
     if confidence > threshold:
-        print(f"Leaf is affected! Match found with: {best_match}, Confidence: {confidence}%")
+        print(f"Leaf is affected! Match found with: {best_match}, Confidence: {confidence}")
+        status = "affected"
     else:
-        print(f"Leaf is healthy or not matching any affected dataset image. Confidence: {confidence}%")
+        print(f"Leaf is healthy or not matching any affected dataset image. Confidence: {confidence}")
+        status = "healthy"
+
+    # Send telemetry data to ThingsBoard
+    telemetry_data = json.dumps({"leaf_status": status, "confidence": confidence})
+    client.publish('v1/devices/me/telemetry', telemetry_data, 1)
 
     # Discard the image after processing
     print("Processing done. Discarding image...")
     return True
 
-# Main Loop
-while True:
-    capture_and_process()
-    time.sleep(300)  # Wait for 5 minutes before capturing the next image
+# MQTT callbacks
+def on_connect(client, userdata, flags, rc):
+    print('Connected with result code ' + str(rc))
+    # Subscribing to receive RPC requests
+    client.subscribe('v1/devices/me/rpc/request/+')
+
+def on_message(client, userdata, msg):
+    print('Topic: ' + msg.topic + '\nMessage: ' + str(msg.payload))
+
+# Initialize MQTT client
+client = mqtt.Client()
+client.on_connect = on_connect
+client.on_message = on_message
+client.username_pw_set(ACCESS_TOKEN)
+client.connect(THINGSBOARD_HOST, 1883, 60)
+
+# Main loop
+try:
+    client.loop_start()
+    while True:
+        capture_and_process()
+        time.sleep(300)  # Wait for 5 minutes before capturing the next image
+except KeyboardInterrupt:
+    print("Exiting...")
+    client.loop_stop()
+    client.disconnect()
